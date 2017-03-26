@@ -5,6 +5,8 @@
 s3duplicity needs duplicity. Install it or s3duplicity will be of no use for you.
 Most distributions have readymade packages available.
 
+Permsssion to your s3 bucket and AWS SNS services on an EC2 linux instance using arn/profile. 
+
 #### Installation and configuration of s3duplicity
 
 The following steps show you how to download, uncompress, and configure the **s3duplicity** on an EC2 Linux instance.
