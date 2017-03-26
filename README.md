@@ -1,1 +1,1 @@
-# s3duplicity
+s3duplicity
