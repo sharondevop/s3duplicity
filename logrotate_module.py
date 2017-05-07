@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 #######################################################################
 #    s3duplicity backup program for duplicity
 #    Copyright (C) 2017 Sharon Mafgaoker.

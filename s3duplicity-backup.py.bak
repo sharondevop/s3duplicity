@@ -25,9 +25,6 @@ import argparse
 import ConfigParser
 import os
 import sys
-from logrotate_module import logrotate_file
-from logrotate_module import rsyslog_file
-
 
 # logrotate file location
 LOGROTATE_FILE = '/etc/logrotate.d/s3duplicity-backup'
@@ -44,6 +41,65 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(sysl)
 
 
+# Create function to create logrotate file.
+def logrotate_file():
+    """
+    Create logrotate file for s3duplicity-backup program.
+    """
+# Check if script run with root
+    if not os.geteuid() == 0:
+        logger.error("Can't create logrotate file %s : must be run as root" % LOGROTATE_FILE)
+        sys.exit("ERROR: Can't create logrotate file %s : must be run as root" % LOGROTATE_FILE)
+
+    logger.info("Trying to create logrotate file: %s " % LOGROTATE_FILE)
+    try:
+        f = open(LOGROTATE_FILE, 'w+')
+        f.write('''/var/log/s3duplicity-backup.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    dateext
+    create 0600 root root
+    copytruncate
+}\n''')
+        f.close()
+        logger.info("Successfully created logrotate file: %s " % LOGROTATE_FILE)
+    except Exception as e:
+        logger.error(str(e))
+        print(str(e))
+    log_enable = subprocess.check_output(['logrotate', LOGROTATE_FILE])
+    print log_enable
+
+# Create function to create rsyslog configuration file.
+def rsyslog_file():
+    """
+    Create rsyslog configuration file for backup-duplicity program.
+    """
+# Check if script run with root
+    if not os.geteuid() == 0:
+        logger.error("Can't create rsyslog file %s : must be run as root" % RSYSLOG_FILE)
+        sys.exit("ERROR: Can't create rsyslog file %s : must be run as root" % RSYSLOG_FILE)
+
+    logger.info("Trying to create rsyslog file: %s " % RSYSLOG_FILE)
+    try:
+        f = open(RSYSLOG_FILE, 'w+')
+        f.write('''# Log backup-duplicity generated log messages to file
+:programname, isequal, "s3duplicity-backup" /var/log/s3duplicity-backup.log
+
+# comment out the following line to allow BACKUP-DUPLICITY messages through.
+# Doing so means you'll also get S3DUPLICITY BACKUP messages in /var/log/syslog
+& ~
+\n''')
+        f.close()
+        logger.info("Successfully created rsyslog file: %s " % RSYSLOG_FILE)
+    except Exception as e:
+        logger.error(str(e))
+        print(str(e))
+    rsyslog_restart = subprocess.check_output(['service', 'rsyslog', 'restart'])
+    print syslog_restart
+
+# Create function - asking user for action
 def yes_or_no(question):
     """
     simple python function for getting a yes or no answer.
@@ -95,6 +151,7 @@ file_prefix = config.get("Options", "file-prefix")
 volsize = config.get("Options", "volsize")
 log_file = config.get("Options", "logfile")
 arn_sns = config.get("Options", "arnsns")
+
 
 # Define AWS SNS message service.
 client = boto3.client('sns',region_name=aws_region)
@@ -150,17 +207,54 @@ def backup_tos3(extra):
     """
     Backup directory to the to the s3 bucket location.
     """
-    param = ['--full-if-older-than '+full_if_older_than,
-            '--no-encryption',
-            '--file-prefix '+file_prefix,
-            '--s3-european-buckets',
-            '--s3-use-new-style',
-            '--volsize '+volsize,
-            source_directory,
-            's3+http://'+target_url
-            ]
-    param[0:0] = extra
-    call_duplicity(param)
+    # Command to run
+    try:
+        prog = '/usr/bin/duplicity'
+        param = ['--full-if-older-than '+full_if_older_than,
+                '--no-encryption',
+                '--file-prefix '+file_prefix,
+                '--s3-european-buckets',
+                '--s3-use-new-style',
+                '--volsize '+volsize,
+                source_directory,
+                's3+http://'+target_url
+                ]
+        param[0:0] = extra
+        logger.info("Start duplicity")
+        # Join cmd list, and run it as a command
+        cmd = "%s %s" % (prog,(' '.join(param)))
+        # run a command and PIPE output and error backup to subprocess
+        p = subprocess.Popen(cmd,shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        (out,err) = p.communicate()
+
+        if p.returncode == 0:
+            print ("command '%s' succeeded, returned: %s" \
+                   % (cmd, str(out)))
+            send_sns(out)
+            logger.info("command '%s' succeeded, returned: %s" \
+                   % (cmd, str(out)))
+        elif p.returncode <= 125:
+            print ("command '%s' failed, exit-code=%d error = %s" \
+                   % (cmd, p.returncode, str(err)))
+            logger.error("command '%s' failed, exit-code=%d error = %s" \
+                   % (cmd, p.returncode, str(err)))
+            send_sns(err)
+        elif p.returncode == 127:
+            logger.error("program '%s' not found: %s" % (prog, str(err)))
+            send_sns(err)
+        else:
+            # Things get hairy and unportable - different shells return
+            # different values for coredumps, signals, etc.
+            send_sns("'%s' likely crashed, shell retruned code %d" % (cmd,p.returncode))
+            sys.exit("'%s' likely crashed, shell retruned code %d" % (cmd,p.returncode))
+    except OSError as e:
+    # unlikely, but still possible: the system failed to execute the shell
+    # itself (out-of-memory, out-of-file-descriptors, and other extreme cases).
+        send_sns("failed to run shell: '%s'" % (str(e)))
+        sys.exit("failed to run shell: '%s'" % (str(e)))
+
+#----------------------------------------------------------------------
+
 
 # Define remove from s3 function
 def remove_froms3(extra):
@@ -168,17 +262,47 @@ def remove_froms3(extra):
     Delete all backup sets older than the given time.
     Old backup sets will not be deleted if backup sets newer than time depend on them.
     """
-    param = ['remove-older-than '+remove_time,
-        '--no-encryption',
-        '--file-prefix '+file_prefix,
-        '--s3-european-buckets',
-        '--s3-use-new-style',
-        's3+http://'+target_url,
-        '--force'
-            ]
-    param[0:0] = extra
-    call_duplicity(param)
+    # Command to run
+    try:
+        prog = '/usr/bin/duplicity'
+        param = ['remove-older-than '+remove_time,
+            '--no-encryption',
+            '--file-prefix '+file_prefix,
+            '--s3-european-buckets',
+            '--s3-use-new-style',
+            's3+http://'+target_url,
+            '--force'
+               ]
+        param[0:0] = extra
+        logger.info("Start duplicity")
+        # Join cmd list, and run it as a command
+        cmd = "%s %s" % (prog,(' '.join(param)))
+        # run a command and PIPE output and error backup to subprocess
+        p = subprocess.Popen(cmd,shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        (out,err) = p.communicate()
 
+        if p.returncode == 0:
+            print ("command '%s' succeeded, returned: %s" \
+                   % (cmd, str(out)))
+            logger.info("command '%s' succeeded, returned: %s" \
+                   % (cmd, str(out)))
+        elif p.returncode <= 125:
+            print ("command '%s' failed, exit-code=%d error = %s" \
+                   % (cmd, p.returncode, str(err)))
+            logger.error("command '%s' failed, exit-code=%d error = %s" \
+                   % (cmd, p.returncode, str(err)))
+        elif p.returncode == 127:
+            logger.error("program '%s' not found: %s" % (prog, str(err)))
+        else:
+            # Things get hairy and unportable - different shells return
+            # different values for coredumps, signals, etc.
+            sys.exit("'%s' likely crashed, shell retruned code %d" % (cmd,e.returncode))
+    except OSError as e:
+    # unlikely, but still possible: the system failed to execute the shell
+    # itself (out-of-memory, out-of-file-descriptors, and other extreme cases).
+        sys.exit("failed to run shell: '%s'" % (str(e)))
+
+#-------------------------------------------------------------------------------------------------
 
 def lists3_file():
     """
@@ -203,6 +327,10 @@ def restore_froms3(extra):
         restore_dir,
             ]
     call_duplicity(param)
+
+
+
+# ----------------------------------------------------------------------------------------------------
 
 
 # Get argument from command line
@@ -236,13 +364,39 @@ def get_args():
     args =  parser.parse_args()
 # Add argument not in config file
     extra = args.const_collection
+    number = 0
+    if args.lists3:
+        number += 10
+    if args.s3backup:
+        number += 20
+    if args.remove:
+        number += 50
+    if args.restore:
+        number += 90
 
- #   def count_true(l):
- #       return len(filter(None, l))
+    def count_true(l):
+        return len(filter(None, l))
+
+    if [args.lists3, args.s3backup, ...].count(True) != 1:
+        # exit
 
 # Check no conflict args given
-   if [args.lists3, args.s3backup, args.remove, args.restore].count(True) != 1:
-       sys.exit("Command line error: Enter '--help' for help screen").
+    if number == 0:
+        sys.exit("No args given")
+    elif args.lists3:
+        lists3_file()
+        logger.info("lists3_file argument parses: %s " % args)
+    elif number == 20:
+        backup_tos3(extra)
+        logger.info("s3backup argument parses: %s " % args)
+    elif number == 50:
+        remove_froms3(extra)
+        logger.info("remove_froms3 argument parses: %s " % args)
+    elif number == 90:
+        restore_froms3(extra)
+        logger.info("restore_froms3 argument parses: %s " % args)
+    else:
+        sys.exit("Command line error: Enter '--help' for help screen")
 
 #----------------------------------------------------------------------
 if __name__ == "__main__":
